@@ -1,0 +1,159 @@
+name: mesa
+
+on:
+  schedule:
+    # Daily; does nothing unless upstream or the packaging changed
+    - cron: "17 3 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "mesa/**"
+      - "scripts/**"
+      - ".github/workflows/mesa.yml"
+  pull_request:
+    paths:
+      - "mesa/**"
+      - "scripts/**"
+      - ".github/workflows/mesa.yml"
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "Upload to the PPA even if the version already exists"
+        type: boolean
+        default: true
+      test_build:
+        description: "Build the binary packages on arm64 before uploading"
+        type: boolean
+        default: true
+
+concurrency:
+  group: mesa-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PPA: vidplace7/nintendo-nx
+  DEBFULLNAME: ${{ vars.DEBFULLNAME || 'vidplace7' }}
+  DEBEMAIL: ${{ vars.DEBEMAIL || 'vidplace7@gmail.com' }}
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  source:
+    runs-on: ubuntu-26.04-arm
+    container: ubuntu:${{ matrix.dist }}
+    strategy:
+      matrix:
+        dist: [resolute]
+    outputs:
+      needed: ${{ steps.build.outputs.needed }}
+      version: ${{ steps.build.outputs.version }}
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl jq git make dpkg-dev devscripts debhelper quilt
+      - uses: actions/checkout@v7
+        with:
+          # INC is the number of commits touching mesa/
+          fetch-depth: 0
+      - name: Build source package
+        id: build
+        env:
+          # Always build for pull requests and explicitly requested manual uploads
+          PPA: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.upload) && env.PPA || '' }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          scripts/build-source.sh mesa ${{ matrix.dist }} "$GITHUB_WORKSPACE/out"
+      - uses: actions/upload-artifact@v7
+        if: steps.build.outputs.needed == 'true'
+        with:
+          name: mesa-source-${{ matrix.dist }}
+          path: out/
+          retention-days: 7
+
+  test-build:
+    needs: source
+    if: >-
+      needs.source.outputs.needed == 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.test_build)
+    runs-on: ubuntu-26.04-arm
+    container: ubuntu:${{ matrix.dist }}
+    timeout-minutes: 300
+    strategy:
+      matrix:
+        dist: [resolute]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: mesa-source-${{ matrix.dist }}
+          path: out
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev devscripts equivs
+          # Built packages land next to the source tree, so keep it in its own directory
+          mkdir build
+          dpkg-source -x out/*.dsc build/src
+          mk-build-deps -i -r -t "apt-get -y --no-install-recommends" build/src/debian/control
+      - name: Build binary packages
+        working-directory: build/src
+        run: dpkg-buildpackage -b -uc -us -j"$(nproc)"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mesa-debs-${{ matrix.dist }}-arm64-${{ needs.source.outputs.version }}
+          # Debug symbols are most of the size; leave them out
+          path: |
+            build/*.deb
+            build/*.buildinfo
+            build/*.changes
+            !build/*-dbgsym_*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  upload:
+    needs: [source, test-build]
+    if: >-
+      always() &&
+      (needs.source.outputs.needed == 'true' ||
+       (github.event_name == 'workflow_dispatch' && inputs.upload)) &&
+      needs.source.result == 'success' &&
+      (needs.test-build.result == 'success' || needs.test-build.result == 'skipped') &&
+      (github.event_name == 'schedule' || github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.upload)) &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04-arm
+    container: ubuntu:${{ matrix.dist }}
+    strategy:
+      matrix:
+        dist: [resolute]
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates gnupg devscripts dput
+      - uses: actions/download-artifact@v8
+        with:
+          name: mesa-source-${{ matrix.dist }}
+          path: out
+      - name: Sign
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.PPA_GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ vars.PPA_GPG_KEY_ID }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # The key has no passphrase; batch mode makes debsign fail instead of prompting
+          echo batch > "$GNUPGHOME/gpg.conf"
+          KEY=${GPG_KEY_ID:-$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')}
+          debsign --re-sign -k"$KEY" out/*_source.changes
+      - name: Upload to ppa:${{ env.PPA }}
+        # -u: Launchpad verifies the signature; the runner has no public keyring
+        run: dput -u "ppa:$PPA" out/*_source.changes
+      - name: Clean up key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/gnupg"
